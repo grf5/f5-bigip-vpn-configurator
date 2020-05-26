@@ -71,11 +71,13 @@ cmdargs.add_argument('--password',action='store',required=True,type=str,help='pa
 cmdargs.add_argument('--licensekey',action='store',required=False,type=str,help='license key for licensing')
 cmdargs.add_argument('--hostname',action='store',required=False,type=str,help='hostname to configure on the BIG-IP')
 cmdargs.add_argument('--ntpserver',action='store',required=False,type=str,help='NTP server to add to the BIG-IP')
-cmdargs.add_argument('--vpn-localselfip',action='store',required=True,type=str,help='the private self-ip address of the VE where the public address is mapped')
-cmdargs.add_argument('--vpn-localpublicip',action='store',required=True,type=str,help='the public IP address of the VNA')
-cmdargs.add_argument('--vpn-remotepublicip',action='store',required=True,type=str,help='the public IP address of the remote IPSec peer')
-cmdargs.add_argument('--vpn-presharedkey',action='store',required=True,type=str,help='the pre-shared key for encryption')
-cmdargs.add_argument('--vpn-tunnelname',action='store',required=True,type=str,help='a name for the new tunnel')
+cmdargs.add_argument('--localselfip',action='store',required=True,type=str,help='the private self-ip address of the VE where the public address is mapped')
+cmdargs.add_argument('--localpublicip',action='store',required=True,type=str,help='the public IP address of the VNA')
+cmdargs.add_argument('--remotepublicip',action='store',required=True,type=str,help='the public IP address of the remote IPSec peer')
+cmdargs.add_argument('--presharedkey',action='store',required=True,type=str,help='the pre-shared key for encryption')
+cmdargs.add_argument('--tunnelsourcenet',action='store',required=True,type=str,help='CIDR notated source network')
+cmdargs.add_argument('--tunneldestinationnet',action='store',required=True,type=str,help='CIDR notated destination network')
+cmdargs.add_argument('--tunnelselfiplocal',action='store',required=True,type=str,help='CIDR notated tunnel self-IP address')
 
 parsed_args = cmdargs.parse_args()
 
@@ -85,103 +87,255 @@ password = parsed_args.password
 license_key = parsed_args.licensekey
 hostname = parsed_args.hostname
 ntpserver = parsed_args.ntpserver
-vpn['local-self-ip'] = parsed_args.vpn-localselfip
-vpn['local-public-ip'] = parsed_args.vpn-localpublicip
-vpn['remote-public-ip'] = parsed_args.vpn-remotepublicip
-vpn['pre-shared-key'] = parsed_args.vpn-presharedkey
-vpn['tunnel-name'] = parsed_args.vpn-tunnelname
+vpn = {}
+vpn['local-self-ip'] = parsed_args.localselfip
+vpn['local-public-ip'] = parsed_args.localpublicip
+vpn['remote-public-ip'] = parsed_args.remotepublicip
+vpn['pre-shared-key'] = parsed_args.presharedkey
+vpn['tunnel-source-network'] = parsed_args.tunnelsourcenet
+vpn['tunnel-destination-network'] = parsed_args.tunneldestinationnet
+vpn['tunnel-name'] = 'ipsec_peer-' + vpn['remote-public-ip']
+vpn['tunnel-self-ip'] = parsed_args.tunnelselfiplocal
+
+# License the VE
+
 if license_key is not None:
     print('Licensing ' + host + ' with key ' + license_key)
-    apiCallResponse = icontrol_post(host,username,password,'/mgmt/tm/sys/license','{"command":"install","registrationKey":"' + license_key + '"}')
-    if '"commandResult":"New license installed\n"' in apiCallResponse:
+    apiCallResponse = icontrol_post(host,username,password,'/mgmt/tm/sys/license',{"command":"install","registrationKey":license_key})
+    if 'New license installed' in apiCallResponse:
         print('License installed successfully.')
+    else:
+        print('Error! ' + apiCallResponse)
+        quit()
 else:
     print("License key not specified - skipping licensing")
 
+# Disable the GUI setup wizard since we're configuring via REST
+
 print('Disabling the GUI Setup Wizard')
-apiCallResponse = icontrol_patch(host,username,password,'/mgmt/tm/sys/global-settings','{"guiSetup":"disabled"}')
+apiCallResponse = icontrol_patch(host,username,password,'/mgmt/tm/sys/global-settings',{"guiSetup":"disabled"})
 if '"kind":"tm:sys:global-settings:global-settingsstate"' and '"guiSetup":"disabled"' in apiCallResponse:
     print('Success!')
+else:
+    print('Error! ' + apiCallResponse)
+    quit()
+
+# Set the hostname if specified
 
 if hostname is not None:
     print('Setting the hostname to ' + hostname + ' on ' + host)
-    apiCallResponse = icontrol_patch(host, username, password, '/mgmt/tm/sys/global-settings','{"hostname":"' + hostname + '"}')
+    apiCallResponse = icontrol_patch(host, username, password, '/mgmt/tm/sys/global-settings',{"hostname":hostname})
     if '"kind":"tm:sys:global-settings:global-settingsstate"' and '"hostname":"' + hostname + '"' in apiCallResponse:
         print('Success!')
+    else:
+        print('Error! ' + apiCallResponse)
+        quit()
 else:
     print('Hostname not specified - skipping hostname configuration')
 
+# Set the NTP server if specified
+
 if ntpserver is not None:
     print('Adding NTP server ' + ntpserver + ' to ' + host)
-    apiCallResponse = icontrol_patch(host,username,password,'/mgmt/tm/sys/ntp','{"servers":["' + ntpserver + '"]}')
+    apiCallResponse = icontrol_patch(host,username,password,'/mgmt/tm/sys/ntp',{"servers":[ntpserver]})
     if '"kind":"tm:sys:ntp:ntpstate"' in apiCallResponse:
         print('Success!')
+    else:
+        print('Error! ' + apiCallResponse)
+        quit()
 else:
     print('NTP server not specified - skipping NTP server configuration')
 
-print('Creating the IPSec Policy')
-apiCallResponse = icontrol_post(host,username,password,'/mgmt/tm/net/ipsec/ipsec-policy','{"name":"comcast-xre-vpn","ike-phase2-auth-algorithm":"sha256","ike-phase2-encrypt-algorithm":"aes256","ike-phase2-perfect-forward-secrecy":"modp1024","mode":"interface"}')
-if '"kind":"tm:net:ipsec:ipsec-policy:ipsec-policystate"' in apiCallResponse:
+#
+# Begin IPSec tunnel configuration steps
+#
+
+# Create the IPSec policy
+
+print('Creating the IPSec Policy (' + vpn['tunnel-name'] + ')')
+apiPayload = {}
+apiPayload['name'] = vpn['tunnel-name']
+apiPayload['ikePhase2AuthAlgorithm'] = 'sha256'
+apiPayload['ikePhase2EncryptAlgorithm'] = 'aes256'
+apiPayload['ikePhase2PerfectForwardSecrecy'] = 'modp1024'
+apiPayload['ikePhase2Lifetime'] = 1440
+apiPayload['ikePhase2LifetimeKilobytes'] = 0
+apiPayload['mode'] = 'interface'
+apiPayload['protocol'] = 'esp'
+apiPayload['ipcomp'] = 'none'
+apiPayload['partition'] = 'Common'
+apiCallResponse = icontrol_post(host,username,password,'/mgmt/tm/net/ipsec/ipsec-policy',apiPayload)
+if '"kind":"tm:net:ipsec:ipsec-policy:ipsec-policystate"' in apiCallResponse :
     print('Success!')
-"""
-9. Create the IPSec Policy
+else:
+    print('Error! ' + apiCallResponse)
+    quit()
 
-curl -sk -H "Content-type: application/json" -u comcast:Password.12345 https://40.112.139.199/mgmt/tm/net/ipsec/ipsec-policy -X POST -d '
+# Create the IPSec traffic selector
 
-RESPONSE: {"kind":"tm:net:ipsec:ipsec-policy:ipsec-policystate","name":"comcast-xre-vpn","partition":"Common","fullPath":"/Common/comcast-xre-vpn","generation":25,"selfLink":"https://localhost/mgmt/tm/net/ipsec/ipsec-policy/~Common~comcast-xre-vpn?ver=12.1.2","ikePhase2AuthAlgorithm":"sha256","ikePhase2EncryptAlgorithm":"aes256","ikePhase2Lifetime":1440,"ikePhase2LifetimeKilobytes":0,"ikePhase2PerfectForwardSecrecy":"modp1024","ipcomp":"none","mode":"interface","protocol":"esp","tunnelLocalAddress":"any6","tunnelRemoteAddress":"any6"}
+print('Creating the IPSec traffic selector (' + vpn['tunnel-name'] + ')')
+apiPayload = {}
+apiPayload['name'] = vpn['tunnel-name']
+apiPayload['partition'] = 'Common'
+apiPayload['action'] = 'protect'
+apiPayload['sourceAddress'] = vpn['tunnel-source-network']
+apiPayload['sourcePort'] = 0
+apiPayload['destinationAddress'] = vpn['tunnel-destination-network']
+apiPayload['destinationPort'] = 0
+apiPayload['direction'] = 'both'
+apiPayload['ipProtocol'] = 255
+apiPayload['ipsecPolicy'] = vpn['tunnel-name']
+apiPayload['order'] = 0
 
-10. Create the IPSec Traffic Selector
+apiCallResponse = icontrol_post(host,username,password,'/mgmt/tm/net/ipsec/traffic-selector',apiPayload)
+if '"kind":"tm:net:ipsec:traffic-selector:traffic-selectorstate"' in apiCallResponse:
+    print('Success!')
+else:
+    print('Error! ' + apiCallResponse)
+    quit()
 
-curl -sk -H "Content-type: application/json" -u comcast:Password.12345 https://40.112.139.199/mgmt/tm/net/ipsec/traffic-selector -X POST -d '{"name":"comcast-xre-vpn","action":"protect","destinationAddress":"0.0.0.0/0","destinationPort":0,"sourceAddress":"0.0.0.0/0","sourcePort":0,"order":0,"ipsecPolicy":"comcast-xre-vpn"}'
+# Set the default IPSec traffic selector to high order
 
-RESPONSE: {"kind":"tm:net:ipsec:traffic-selector:traffic-selectorstate","name":"comcast-xre-vpn","partition":"Common","fullPath":"/Common/comcast-xre-vpn","generation":26,"selfLink":"https://localhost/mgmt/tm/net/ipsec/traffic-selector/~Common~comcast-xre-vpn?ver=12.1.2","action":"protect","destinationAddress":"0.0.0.0/0","destinationPort":0,"direction":"both","ipProtocol":255,"ipsecPolicy":"/Common/comcast-xre-vpn","ipsecPolicyReference":{"link":"https://localhost/mgmt/tm/net/ipsec/ipsec-policy/~Common~comcast-xre-vpn?ver=12.1.2"},"order":0,"sourceAddress":"0.0.0.0/0","sourcePort":0}
+print('Setting the default IPSec traffic selector to order 100')
+apiPayload = {}
+apiPayload['order'] = 100
+apiCallResponse = icontrol_patch(host,username,password,'/mgmt/tm/net/ipsec/traffic-selector/default-traffic-selector-interface',apiPayload)
+if '"kind":"tm:net:ipsec:traffic-selector:traffic-selectorstate"' in apiCallResponse:
+    print('Success!')
+else:
+    print('Error! ' + apiCallResponse)
+    quit()
 
-11. Set the default IPSec traffic selector to higher order
+# Create the IKE peer
 
-curl -sk -H "Content-type: application/json" -u comcast:Password.12345 https://40.112.139.199/mgmt/tm/net/ipsec/traffic-selector/default-traffic-selector-interface -X PATCH -d '{"order":1}'
+print('Creating the IKE peer (' + vpn['tunnel-name'] + ')')
+apiPayload = {}
+apiPayload['name'] = vpn['tunnel-name']
+apiPayload['myIdType'] = 'address'
+apiPayload['myIdValue'] = vpn['local-public-ip']
+apiPayload['peersIdType'] = 'address'
+apiPayload['peersIdValue'] = vpn['remote-public-ip']
+apiPayload['phase1AuthMethod'] = 'pre-shared-key'
+apiPayload['phase1EncryptAlgorithm'] = 'aes256'
+apiPayload['phase1HashAlgorithm'] = 'sha256'
+apiPayload['phase1PerfectForwardSecrecy'] = 'modp1024'
+apiPayload['prf'] = 'sha256'
+apiPayload['presharedKey'] = vpn['pre-shared-key']
+apiPayload['remoteAddress'] = vpn['remote-public-ip']
+apiPayload['version'] = ['v2']
+apiPayload['dpdDelay'] = 30
+apiPayload['lifetime'] = 1440
+apiPayload['mode'] = 'main'
+apiPayload['natTraversal'] = 'off'
+apiPayload['passive'] = 'false'
+apiPayload['generatePolicy'] = 'off'
+apiPayload['trafficSelector'] = [vpn['tunnel-name']]
+apiCallResponse = icontrol_post(host,username,password,'/mgmt/tm/net/ipsec/ike-peer',apiPayload)
+if '"kind":"tm:net:ipsec:ike-peer:ike-peerstate"' in apiCallResponse:
+    print('Success!')
+else:
+    print('Error! ' + apiCallResponse)
+    quit()
 
-{"kind":"tm:net:ipsec:traffic-selector:traffic-selectorstate","name":"default-traffic-selector-interface","fullPath":"default-traffic-selector-interface","generation":28,"selfLink":"https://localhost/mgmt/tm/net/ipsec/traffic-selector/default-traffic-selector-interface?ver=12.1.2","action":"protect","destinationAddress":"::/0","destinationPort":0,"direction":"both","ipProtocol":255,"ipsecPolicy":"/Common/default-ipsec-policy-interface","ipsecPolicyReference":{"link":"https://localhost/mgmt/tm/net/ipsec/ipsec-policy/~Common~default-ipsec-policy-interface?ver=12.1.2"},"order":1,"sourceAddress":"::/0","sourcePort":0}
+# Create the tunnel profile
 
-12. Create IKE Peer
+print('Creating the tunnel profile (' + vpn['tunnel-name'] + ')')
+apiPayload = {}
+apiPayload['name'] = vpn['tunnel-name']
+apiPayload['defaultsFrom'] = '/Common/ipsec'
+apiPayload['trafficSelector'] = vpn['tunnel-name']
 
-curl -sk -H "Content-type: application/json" -u comcast:Password.12345 https://40.112.139.199/mgmt/tm/net/ipsec/ike-peer -X POST -d '{"name":"comcast-xre-vpn","myIdType":"address","myIdValue":"40.112.139.199","peersIdType":"address","peersIdValue":"98.114.173.215","phase1AuthMethod":"pre-shared-key","phase1EncryptAlgorithm":"aes256","phase1HashAlgorithm":"sha256","phase1PerfectForwardSecrecy":"modp1024","prf":"sha256","presharedKey":"myTunnel1234!","remoteAddress":"98.114.173.215","version":["v2"],"dpdDelay":30,"lifetime":1440,"mode":"main","natTraversal":"off","passive":"false","generatePolicy":"off","trafficSelector":["comcast-xre-vpn"]}'
+apiCallResponse = icontrol_post(host,username,password,'/mgmt/tm/net/tunnels/ipsec',apiPayload)
+if '"kind":"tm:net:tunnels:ipsec:ipsecstate"' in apiCallResponse:
+    print('Success!')
+else:
+    print('Error! ' + apiCallResponse)
+    quit()
 
-RESPONSE: {"kind":"tm:net:ipsec:ike-peer:ike-peerstate","name":"comcast-xre-vpn","partition":"Common","fullPath":"/Common/comcast-xre-vpn","generation":33,"selfLink":"https://localhost/mgmt/tm/net/ipsec/ike-peer/~Common~comcast-xre-vpn?ver=12.1.2","dpdDelay":30,"generatePolicy":"off","lifetime":1440,"mode":"main","myIdType":"address","myIdValue":"40.112.139.199","natTraversal":"off","passive":"false","peersCertType":"none","peersIdType":"address","peersIdValue":"98.114.173.215","phase1AuthMethod":"pre-shared-key","phase1EncryptAlgorithm":"aes256","phase1HashAlgorithm":"sha256","phase1PerfectForwardSecrecy":"modp1024","presharedKeyEncrypted":"$M$kg$FeIo0kbjr9XJq+wsRXJFkQ==","prf":"sha256","proxySupport":"enabled","remoteAddress":"98.114.173.215","replayWindowSize":64,"state":"enabled","trafficSelector":["/Common/comcast-xre-vpn"],"trafficSelectorReference":[{"link":"https://localhost/mgmt/tm/net/ipsec/traffic-selector/~Common~comcast-xre-vpn?ver=12.1.2"}],"verifyCert":"false","version":["v2"]}
+# Create the tunnel object
 
-13. Create tunnel profile
+print('Creating the tunnel object (' + vpn['tunnel-name'] + ')')
+apiPayload = {}
+apiPayload['name'] = vpn['tunnel-name']
+apiPayload['autoLasthop'] = 'default'
+apiPayload['idleTimeout'] = 300
+apiPayload['key'] = 0
+apiPayload['localAddress'] = vpn['local-self-ip']
+apiPayload['mode'] = 'bidirectional'
+apiPayload['mtu'] = 0
+apiPayload['profile'] = vpn['tunnel-name']
+apiPayload['remoteAddress'] = vpn['remote-public-ip']
+apiPayload['tos'] = 'preserve'
+apiPayload['transparent'] = 'disabled'
+apiPayload['usePmtu'] = 'enabled'
+apiCallResponse = icontrol_post(host,username,password,'/mgmt/tm/net/tunnels/tunnel',apiPayload)
+if '"kind":"tm:net:tunnels:tunnel:tunnelstate"' in apiCallResponse:
+    print('Success!')
+else:
+    print('Error! ' + apiCallResponse)
+    quit()
 
-curl -sk -H "Content-type: application/json" -u comcast:Password.12345 https://40.112.139.199/mgmt/tm/net/tunnels/ipsec -X POST -d '{"name":"comcast-xre-vpn","trafficSelector":"comcast-xre-vpn"}'
+# Create the self-IP for the tunnel-route
 
-RESPONSE: {"kind":"tm:net:tunnels:ipsec:ipsecstate","name":"comcast-xre-vpn","partition":"Common","fullPath":"/Common/comcast-xre-vpn","generation":34,"selfLink":"https://localhost/mgmt/tm/net/tunnels/ipsec/~Common~comcast-xre-vpn?ver=12.1.2","defaultsFrom":"/Common/ipsec","defaultsFromReference":{"link":"https://localhost/mgmt/tm/net/tunnels/ipsec/~Common~ipsec?ver=12.1.2"},"trafficSelector":"/Common/comcast-xre-vpn","trafficSelectorReference":{"link":"https://localhost/mgmt/tm/net/ipsec/traffic-selector/~Common~comcast-xre-vpn?ver=12.1.2"}}
+print('Creating the local tunnel interface self-IP (' + vpn['tunnel-name'] + ')')
+apiPayload = {}
+apiPayload['name'] = vpn['tunnel-name']
+apiPayload['address'] = vpn['tunnel-self-ip']
+apiPayload['vlan'] = vpn['tunnel-name']
+apiPayload['traffic-group'] = 'traffic-group-local-only'
+apiPayload['allowService'] = 'all'
+apiCallResponse = icontrol_post(host,username,password,'/mgmt/tm/net/self',apiPayload)
+if '"kind":"tm:net:self:selfstate"' in apiCallResponse:
+    print('Success!')
+else:
+    print('Error! ' + apiCallResponse)
+    quit()
 
-14. Create the tunnel
+# Create the static route for tunneling
 
-curl -sk -H "Content-type: application/json" -u comcast:Password.12345 https://40.112.139.199/mgmt/tm/net/tunnels/tunnel -X POST -d '{"name":"comcast-xre-vpn","idleTimeout": 300,"mode": "bidirectional","profile":"comcast-xre-vpn","tos": "preserve","localAddress":"10.0.0.4","remoteAddress":"98.114.173.215"}'
+print('Creating the static route (' + vpn['tunnel-name'] + ')')
+apiPayload = {}
+apiPayload['name'] = vpn['tunnel-name']
+apiPayload['tmInterface'] = vpn['tunnel-name']
+apiPayload['network'] = vpn['tunnel-destination-network']
+apiPayload['mtu'] = 0
+apiCallResponse = icontrol_post(host,username,password,'/mgmt/tm/net/route',apiPayload)
+if '"kind":"tm:net:route:routestate"' in apiCallResponse:
+    print('Success!')
+else:
+    print('Error! ' + apiCallResponse)
+    quit()
 
-RESPONSE: {"kind":"tm:net:tunnels:tunnel:tunnelstate","name":"comcast-xre-vpn","partition":"Common","fullPath":"/Common/comcast-xre-vpn","generation":35,"selfLink":"https://localhost/mgmt/tm/net/tunnels/tunnel/~Common~comcast-xre-vpn?ver=12.1.2","autoLasthop":"default","idleTimeout":300,"ifIndex":128,"key":0,"localAddress":"10.0.0.4","mode":"bidirectional","mtu":0,"profile":"/Common/comcast-xre-vpn","profileReference":{"link":"https://localhost/mgmt/tm/net/tunnels/ipsec/~Common~comcast-xre-vpn?ver=12.1.2"},"remoteAddress":"98.114.173.215","secondaryAddress":"any6","tos":"preserve","transparent":"disabled","usePmtu":"enabled"}
+# Create the default IP forwarding virtual server
 
-15. Create the self-IP for the tunnel route
+print('Creating the default IP forwarding virtual server')
+apiPayload = {}
+apiPayload['name'] = 'ip_forwarding_vs'
+apiPayload['destination'] = '/Common/0.0.0.0:0'
+apiPayload['ipProtocol'] = 'any'
+apiPayload['mask'] = '0.0.0.0'
+apiPayload['source'] = '0.0.0.0/0'
+apiPayload['sourceAddressTranslation'] = {'type':'none'}
+apiPayload['sourcePort'] = 'preserve'
+apiPayload['profiles'] = ['/Common/fastL4']
+apiPayload['enabled'] = True
+apiPayload['translateAddress'] = 'disabled'
+apiPayload['translatePort'] = 'disabled'
+apiCallResponse = icontrol_post(host,username,password,'/mgmt/tm/ltm/virtual',apiPayload)
+if '"kind":"tm:ltm:virtual:virtualstate"' in apiCallResponse:
+    print('Success!')
+else:
+    print('Error! ' + apiCallResponse)
+    quit()
 
-curl -sk -H "Content-type: application/json" -u comcast:Password.12345 https://40.112.139.199/mgmt/tm/net/self -X POST -d '{"name":"comcast-xre-vpn","address":"1.1.1.1/32","vlan":"comcast-xre-vpn","traffic-group":"traffic-group-local-only","allowService":"all"}'
+# Save the configuration
 
-RESPONSE: {"kind":"tm:net:self:selfstate","name":"comcast-xre-vpn","partition":"Common","fullPath":"/Common/comcast-xre-vpn","generation":40,"selfLink":"https://localhost/mgmt/tm/net/self/~Common~comcast-xre-vpn?ver=12.1.2","address":"1.1.1.1/32","addressSource":"from-user","floating":"disabled","inheritedTrafficGroup":"false","trafficGroup":"/Common/traffic-group-local-only","trafficGroupReference":{"link":"https://localhost/mgmt/tm/cm/traffic-group/~Common~traffic-group-local-only?ver=12.1.2"},"unit":0,"vlan":"/Common/comcast-xre-vpn","vlanReference":{"link":"https://localhost/mgmt/tm/net/tunnels/tunnel/~Common~comcast-xre-vpn?ver=12.1.2"},"allowService":"all"}
-
-16. Create the static route for the tunnel
-
-curl -sk -H "Content-type: application/json" -u comcast:Password.12345 https://40.112.139.199/mgmt/tm/net/route -X POST -d '{"name":"comcast-xre-vpn","tmInterface": "/Common/comcast-xre-vpn","network": "10.0.0.0/8","mtu":0}'
-
-RESPONSE: {"kind":"tm:net:route:routestate","name":"comcast-xre-vpn","partition":"Common","fullPath":"/Common/comcast-xre-vpn","generation":43,"selfLink":"https://localhost/mgmt/tm/net/route/~Common~comcast-xre-vpn?ver=12.1.2","tmInterface":"/Common/comcast-xre-vpn","tmInterfaceReference":{"link":"https://localhost/mgmt/tm/net/tunnels/tunnel/~Common~comcast-xre-vpn?ver=12.1.2"},"mtu":0,"network":"10.0.0.0/8"}
-
-17. Create the IP forwarding virtual listener
-
-curl -sk -H "Content-type: application/json" -u comcast:Password.12345 https://40.112.139.199/mgmt/tm/ltm/virtual -X POST -d '{"name":"ip_forwarding_vs","destination":"/Common/0.0.0.0:0","ipProtocol":"any","mask":"255.255.255.255","source":"0.0.0.0/0","sourceAddressTranslation":{"type":"none"},"sourcePort":"preserve","profiles":["fastL4"]}'
-
-RESPONSE: {"kind":"tm:ltm:virtual:virtualstate","name":"ip_forwarding_vs","partition":"Common","fullPath":"/Common/ip_forwarding_vs","generation":46,"selfLink":"https://localhost/mgmt/tm/ltm/virtual/~Common~ip_forwarding_vs?ver=12.1.2","addressStatus":"yes","autoLasthop":"default","cmpEnabled":"yes","connectionLimit":0,"destination":"/Common/0.0.0.0:0","enabled":true,"gtmScore":0,"ipProtocol":"any","mask":"255.255.255.255","mirror":"disabled","mobileAppTunnel":"disabled","nat64":"disabled","rateLimit":"disabled","rateLimitDstMask":0,"rateLimitMode":"object","rateLimitSrcMask":0,"serviceDownImmediateAction":"none","source":"0.0.0.0/0","sourceAddressTranslation":{"type":"none"},"sourcePort":"preserve","synCookieStatus":"not-activated","translateAddress":"disabled","translatePort":"disabled","vlansDisabled":true,"vsIndex":5,"policiesReference":{"link":"https://localhost/mgmt/tm/ltm/virtual/~Common~ip_forwarding_vs/policies?ver=12.1.2","isSubcollection":true},"profilesReference":{"link":"https://localhost/mgmt/tm/ltm/virtual/~Common~ip_forwarding_vs/profiles?ver=12.1.2","isSubcollection":true}}
-
-18. Save the configuration
-
-curl -sk -H "Content-type: application/json" -u comcast:Password.12345 https://40.112.139.199/mgmt/tm/sys/config -X POST -d '{"command":"save"}'
-
-RESPONSE: {"kind":"tm:sys:config:savestate","command":"save"}
-
-"""
+print('Saving the configuration')
+apiPayload = {}
+apiPayload['command'] = 'save'
+apiCallResponse = icontrol_post(host,username,password,'/mgmt/tm/sys/config',apiPayload)
+if '"kind":"tm:sys:config:savestate","command":"save"' in apiCallResponse:
+    print('Success!')
+else:
+    print('Error! ' + apiCallResponse)
+    quit()
